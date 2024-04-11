@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+from torch.optim import lr_scheduler
 import datetime
 from datetime import datetime
 import numpy as np
@@ -39,7 +40,7 @@ parser.add_argument('--eval-batch-size', type=int, default=8,
                     help='evaluation batch-size to use')
 parser.add_argument('--accumulation-steps', type=int, default=8,
                     help='accumulate gradients this many times before updating parameters')
-parser.add_argument('--lr-classifer', type=float, default=0.001,
+parser.add_argument('--lr-classifier', type=float, default=0.001,
                     help='learning rate for new classifier head')
 parser.add_argument('--lr-extractor', type=float, default=0.0001,
                     help='learning rate for finetuning feature extractor')
@@ -75,7 +76,8 @@ with open('commandline_args.txt', 'a') as f:
     json.dump(args.__dict__, f, indent=2)
 f.close()
 
-use_cuda = not args.no_cuda and torch.cuda.is_available()
+#use_cuda = not args.no_cuda and torch.cuda.is_available()
+use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
 torch.cuda.empty_cache()
@@ -226,10 +228,10 @@ def evaluate(model, loader):
             loss += F.cross_entropy(outputs, labels).item()
 
     accuracy = 100 * correct / total
-    loss /= len(testloader)
+    loss /= len(loader)
 
-    print('Accuracy on the train set: %.3f %%' % (accuracy))
-    print('Loss on the train set: %.3f' % (loss))
+    print('Accuracy: %.3f %%' % (accuracy))
+    print('Loss: %.5f' % (loss))
 
     return accuracy, loss
 
@@ -239,18 +241,26 @@ def main():
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
 
+    #299 for inception
+    #224 resnet
+
+    if args.arch == "inception_v3":
+        final_size = 299
+    else:
+        final_size = 224
+    
     train_transform = transforms.Compose(
-                [transforms.Resize((224,224), interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
-                  transforms.ToTensor(),
-                  transforms.RandomHorizontalFlip(),
-                  transforms.RandomCrop(224, padding=4),
-                  transforms.Normalize(mean, std)
+                [transforms.RandomResizedCrop(final_size),
+                 transforms.RandomHorizontalFlip(),
+                 transforms.ToTensor(),
+                 transforms.Normalize(mean, std)
                  ])
 
 
 
     gen_transform = transforms.Compose(
-                [transforms.Resize((224,224), interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
+                [transforms.Resize(final_size+32),
+                 transforms.CenterCrop(final_size),
                  transforms.ToTensor(),
                  transforms.Normalize(mean, std)
                  ])
@@ -286,6 +296,47 @@ def main():
         H, W = 96, 96
         targs_ds = trainset.labels
 
+    elif (args.dataset == "FLOWERS"):
+        trainset = torchvision.datasets.Flowers102(root='../data', split='train', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.Flowers102(root='../data', split='train', download=True, transform=train_transform)
+        valset = torchvision.datasets.Flowers102(root='../data', split='val', download=True, transform=gen_transform)
+        testset = torchvision.datasets.Flowers102(root='../data', split='test', download=True, transform=gen_transform)
+
+        trainset._labels.extend(valset._labels)
+        trainset._image_files.extend(valset._image_files)
+        eval_trainset._labels.extend(valset._labels)
+        eval_trainset._image_files.extend(valset._image_files)
+
+        nclass = 102
+        nchannels=3
+        H,W = 224, 224
+        targs_ds = trainset._labels
+
+    elif (args.dataset == "OXFORD"):
+        trainset = torchvision.datasets.OxfordIIITPet(root='../data', split='trainval', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.OxfordIIITPet(root='../data', split='trainval', download=True, transform=train_transform)
+        testset = torchvision.datasets.OxfordIIITPet(root='../data', split='test', download=True, transform=gen_transform)
+        nclass=37
+        nchannels=3
+        H,W = 224, 224
+        targs_ds = trainset._labels
+    elif (args.dataset == "NATURE"):
+        trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
+        testset = torchvision.datasets.INaturalist(root='../data', version='2021_valid', download=True, transform=gen_transform)
+        nclass=1000
+        nchannels=3
+        H,W = 224, 224
+        targs_ds = trainset.all_categories
+
+    elif (args.dataset == "CARS"):
+        trainset = torchvision.datasets.StanfordCars(root='../data', split='train', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.StanfordCars(root='../data', split='train', download=True, transform=train_transform)
+        testset = torchvision.datasets.StanfordCars(root='../data', split='test', download=True, transform=gen_transform)
+        nclass=196
+        nchannels=3
+        H,W = 224, 224
+        targs_ds = trainset._samples
     elif (args.dataset == "CALTECH256"):
         trainset = torchvision.datasets.Caltech256(root='../data', split='train', download=True, transform=train_transform)
         eval_trainset = torchvision.datasets.Caltech256(root='../data', split='train', download=True, transform=train_transform)
@@ -303,17 +354,20 @@ def main():
 
     #split the trainset by label into separate subsets and create a separate dataloader for each class
     # Get unique labels
-    unique_labels = set(trainset.targets)
+    if args.dataset != "CARS":
+        unique_labels = set(targs_ds)
+    else:
+        unique_labels = set([c for (name, c) in targs_ds])
     # Create a dictionary to store dataloaders for each class
     compact_dataloaders = {}
     # Iterate over unique labels
     for label in unique_labels:
         # Get indices of data points with the current label
-        indices = [i for i, target in enumerate(trainset.targets) if target == label]
+        indices = [i for i, target in enumerate(targs_ds) if target == label]
         # Create a subset of the trainset with the current label
         subset = Subset(trainset, indices)
         # Create a dataloader for the subset
-        dataloader = DataLoader(subset, batch_size=eval_batch_size, shuffle=True)
+        dataloader = DataLoader(subset, batch_size=args.eval_batch_size, shuffle=True)
         # Add the dataloader to the dictionary
         compact_dataloaders[label] = dataloader
         
@@ -327,6 +381,7 @@ def main():
     elif args.arch =="inception_v3":
         weights = models.Inception_V3_Weights.DEFAULT
         model_ft = models.inception_v3(weights=weights)
+        model_ft.aux_logits = False
     elif args.arch == "shufflenet_v2_x2_0":
         weights = models.ShuffleNet_V2_X2_0_Weights.DEFAULT
         model_ft = models.shufflenet_v2_x2_0(weights=weights)
@@ -339,19 +394,33 @@ def main():
     elif args.arch == "swin_t":
         weights = models.Swin_T_Weights.DEFAULT
         model_ft = models.swin_t(weights=weights)
-    elif args.arch == "ViT_B_16":
-        weights = models.ViT_B_16_Weights.DEFAULT
-        model_ft = models.vit_b_16(weights=weights)
+    elif args.arch == "max_vit":
+        weights = models.MaxVit_T_Weights.DEFAULT
+        model_ft = models.maxvit_t(weights=weights)
     elif args.arch == "efficientnet_b0":
         weights = models.EfficientNet_B0_Weights.DEFAULT
         model_ft = models.efficientnet_b0(weights=weights)
     else:
         raise ValueError("Unknown architecture")
 
-
-    num_ftrs = model_ft.fc.in_features
-    out_ftrs = nclass
-    model_ft.fc = nn.Sequential()
+    #print (model_ft)
+    if args.arch not in ["swin_t", "max_vit", "densenet121"]:
+        num_ftrs = model_ft.fc.in_features
+        out_ftrs = nclass
+        model_ft.fc = nn.Sequential()
+    else:
+        out_ftrs = nclass
+        if args.arch == "swin_t":
+            num_ftrs = model_ft.head.in_features
+            model_ft.head = nn.Sequential()
+        elif args.arch == "densenet121":
+            num_ftrs = model_ft.classifier.in_features
+            model_ft.classifier = nn.Sequential()
+        else:
+            num_ftrs = 512
+            model_ft.classifier = nn.Sequential(nn.AdaptiveAvgPool2d(output_size=1),
+                                                nn.Flatten(start_dim=1, end_dim=-1),
+                                                nn.LayerNorm((512,), eps=1e-05, elementwise_affine=True))
 
 
     #wrap feature extractor with new classification head.  Allows explicit return of feature vectors.
@@ -359,13 +428,16 @@ def main():
 
     if not args.finetune:
         print ("not finetuning")
-        optimizer = optim.SGD(cur_model.linear.parameters(), lr=args.lr_classifer, momentum=args.momentum, weight_decay=args.weight_decay)
+        optimizer = optim.SGD(cur_model.linear.parameters(), lr=args.lr_classifier, momentum=args.momentum, weight_decay=args.weight_decay)
         #optimizer = optim.Adam(cur_model.parameters(), lr=0.00002)
     else:
         optimizer = optim.SGD([{'params': cur_model.extractor.parameters()},
-                          {'params': cur_model.linear.parameters(), 'lr':args.lr_classifer}], lr=args.lr_extractor, momentum=args.momentum, weight_decay=args.weight_decay)
+                          {'params': cur_model.linear.parameters(), 'lr':args.lr_classifier}], lr=args.lr_extractor, momentum=args.momentum, weight_decay=args.weight_decay)
         #optimizer = optim.Adam(cur_model.parameters(), lr=0.00002)
 
+    # Decay LR by a factor of 0.1 every 7 epochs
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+    
     # define a trainloader and testloader
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
     eval_trainloader = torch.utils.data.DataLoader(eval_trainset, batch_size=args.eval_batch_size, shuffle=True)
@@ -409,7 +481,7 @@ def main():
 
             loss = loss / acc_steps
             loss.backward()
-            if (i+1) % accumulation_steps == 0:             
+            if (i+1) % acc_steps == 0:             
                 optimizer.step()                            
                 cur_model.zero_grad()                       
 
@@ -419,11 +491,12 @@ def main():
 
             running_loss += loss.item()
 
-            if i % 25 == 0:
+            if i % 1000 == 0:
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(trainloader.dataset),
-                       100. * batch_idx / len(trainloader), loss.item()))
+                    epoch, i * len(labels), len(trainloader.dataset),
+                       100. * i / len(trainloader), loss.item()))
 
+        scheduler.step()
         train_losses.append(running_loss/len(trainloader))
 
         #print(f'Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}')
@@ -440,7 +513,7 @@ def main():
         test_accs.append(acc_test)
         test_losses.append(loss_test)
 
-        if epoch in [1,5,10,15] and finetune:
+        if epoch in [5,10,15,25] and args.finetune:
             cur_model.multi_out = 1
             compact_mean, compact_std, sep_mean, sep_std = compute_metrics(cur_model, compact_dataloaders)
 
@@ -448,11 +521,16 @@ def main():
             print(f"Intra-class Similarity: Mean = {compact_mean}, Std = {compact_std}")
             print(f"Inter-class Similarity: Mean = {sep_mean}, Std = {sep_std}\n")
 
+        cur_model.multi_out = 0
+        cur_model.train()
+        reset_learnable(cur_model, ft=args.finetune)
+
+
         #if finetuning, metrics are updated, otherwise, metric evaluation on pre-trained extractor is kept and repeated in text file
-        with open('similarity_statistics.txt', 'a') as f:
-            if os.stat('similarity_statistics.txt').st_size == 0:
+        with open('similarity_statistics_{}_{}.txt'.format(args.arch,args.dataset), 'a') as f:
+            if os.stat('similarity_statistics_{}_{}.txt'.format(args.arch,args.dataset)).st_size == 0:
                 f.write('Dataset, Architecture, Train Batch Size, Classifier LR, Finetune, Feature LR, MaxEpochs, Weight Decay, Momentum, Eval Batch Size, Epoch, Training Acc, Test Acc, Intra-class Similarity Mean, Intra-class Similarity Std, Inter-class Similarity Mean, Inter-class Similarity Std\n')
-            f.write(f"{args.dataset}, {args.arch}, {args.train_batch_size}, {args.lr_classifer}, {args.finetune}, {args.lr_extractor}, {args.epochs_max}, {args.weight_decay}, {args.momentum}, {args.eval_batch_size}, {epoch}, {train_accs[-1]:.5f}, {test_accs[-1]:.5f}, {compact_mean:.6f}, {compact_std:.6f}, {sep_mean:.6f}, {sep_std:.6f}\n")
+            f.write(f"{args.dataset}, {args.arch}, {args.train_batch_size}, {args.lr_classifier}, {args.finetune}, {args.lr_extractor}, {args.epochs_max}, {args.weight_decay}, {args.momentum}, {args.eval_batch_size}, {epoch}, {train_accs[-1]:.5f}, {test_accs[-1]:.5f}, {compact_mean:.6f}, {compact_std:.6f}, {sep_mean:.6f}, {sep_std:.6f}\n")
             
 if __name__ == '__main__':
     main()
