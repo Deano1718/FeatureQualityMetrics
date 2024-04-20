@@ -50,6 +50,8 @@ parser.add_argument('--weight-decay', type=float, default=0.0,
                     help='weight-decay for training')
 parser.add_argument('--momentum', type=float, default=0.9,
                     help='momentum for training')
+parser.add_argument('--sourceFineTune', default="ImageNet1K",
+                    help='source dataset for selected model, could have been pretrained or pretrained + finetuned')
 
 
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
@@ -321,8 +323,8 @@ def main():
         H,W = 224, 224
         targs_ds = trainset._labels
     elif (args.dataset == "NATURE"):
-        trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
+        #trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
+        #eval_trainset = torchvision.datasets.INaturalist(root='../data', version='2021_train_mini', download=True, transform=train_transform)
         testset = torchvision.datasets.INaturalist(root='../data', version='2021_valid', download=True, transform=gen_transform)
         nclass=1000
         nchannels=3
@@ -424,7 +426,28 @@ def main():
 
 
     #wrap feature extractor with new classification head.  Allows explicit return of feature vectors.
-    cur_model = TransferWrapper(model_ft, num_ftrs, out_ftrs).to(device)
+    if args.sourceFineTune == "CIFAR100":
+        cur_model = TransferWrapper(model_ft, num_ftrs, 100).to(device)
+        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "CIFAR100")))
+        cur_model.linear = nn.Linear(num_ftrs, nclass)
+        cur_model = cur_model.to(device)
+    elif args.sourceFineTune == "OXFORD":
+        cur_model = TransferWrapper(model_ft, num_ftrs, 37).to(device)
+        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "OXFORD")))
+        cur_model.linear = nn.Linear(num_ftrs, nclass)
+        cur_model = cur_model.to(device)
+    elif args.sourceFineTune == "FLOWERS":
+        cur_model = TransferWrapper(model_ft, num_ftrs, 102).to(device)
+        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "FLOWERS")))
+        cur_model.linear = nn.Linear(num_ftrs, nclass)
+        cur_model = cur_model.to(device)
+    elif args.sourceFineTune == "STL10":
+        cur_model = TransferWrapper(model_ft, num_ftrs, 10).to(device)
+        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "STL10")))
+        cur_model.linear = nn.Linear(num_ftrs, nclass)
+        cur_model = cur_model.to(device)
+    else:
+        cur_model = TransferWrapper(model_ft, num_ftrs, out_ftrs).to(device)
 
     if not args.finetune:
         print ("not finetuning")
@@ -527,11 +550,16 @@ def main():
 
 
         #if finetuning, metrics are updated, otherwise, metric evaluation on pre-trained extractor is kept and repeated in text file
-        with open('similarity_statistics_{}_{}.txt'.format(args.arch,args.dataset), 'a') as f:
-            if os.stat('similarity_statistics_{}_{}.txt'.format(args.arch,args.dataset)).st_size == 0:
+        with open('similarity_statistics_{}_trg{}_src{}.txt'.format(args.arch,args.dataset,args.sourceFineTune), 'a') as f:
+            if os.stat('similarity_statistics_{}_trg{}_src{}.txt'.format(args.arch,args.dataset,args.sourceFineTune)).st_size == 0:
                 f.write('Dataset, Architecture, Train Batch Size, Classifier LR, Finetune, Feature LR, MaxEpochs, Weight Decay, Momentum, Eval Batch Size, Epoch, Training Acc, Test Acc, Intra-class Similarity Mean, Intra-class Similarity Std, Inter-class Similarity Mean, Inter-class Similarity Std\n')
             f.write(f"{args.dataset}, {args.arch}, {args.train_batch_size}, {args.lr_classifier}, {args.finetune}, {args.lr_extractor}, {args.epochs_max}, {args.weight_decay}, {args.momentum}, {args.eval_batch_size}, {epoch}, {train_accs[-1]:.5f}, {test_accs[-1]:.5f}, {compact_mean:.6f}, {compact_std:.6f}, {sep_mean:.6f}, {sep_std:.6f}\n")
-            
+
+    if args.finetune and not args.sourceFineTune:
+        torch.save(cur_model.state_dict(), "finetuned_{}_{}.pt".format(args.arch, args.dataset))
+
+
+    
 if __name__ == '__main__':
     main()
 
