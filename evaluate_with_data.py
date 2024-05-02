@@ -329,10 +329,6 @@ def evaluate(model, loader):
 
 def main():
 
-    #login(token=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)
-    #ds = load_dataset("imagenet-1k")
-    #train_ds = ds["train"]
-    #train_ds[0]["image"]  # a PIL Image
 
     
     mean = [0.485, 0.456, 0.406]
