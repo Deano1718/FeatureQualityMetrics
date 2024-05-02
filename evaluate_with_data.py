@@ -23,7 +23,8 @@ from torchvision import datasets, transforms, models
 from torch.hub import load_state_dict_from_url
 from torch.utils.model_zoo import load_url as load_state_dict_from_url
 
-
+from huggingface_hub import login
+from datasets import load_dataset
 
 
 parser = argparse.ArgumentParser(description='Evaluate feature metrics on pre-trained torchvision architectures')
@@ -34,6 +35,8 @@ parser.add_argument('--arch', default="resnet50",
                     help='which torchvision pretrained architecture to use')
 parser.add_argument('--finetune', type=int, default=0,
                     help='finetune feature extractor with small lr')
+parser.add_argument('--pretrain', type=int, default=0,
+                    help='pretrain a model')
 parser.add_argument('--train-batch-size', type=int, default=8,
                     help='training batch-size to use')
 parser.add_argument('--eval-batch-size', type=int, default=8,
@@ -54,10 +57,8 @@ parser.add_argument('--sourceFineTune', default="ImageNet1K",
                     help='source dataset for selected model, could have been pretrained or pretrained + finetuned')
 
 
-parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
-parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for testing (default: 128)')
+parser.add_argument('--nu', type=int, default=0,
+                    help='nu for covariance approximation')
 
 parser.add_argument('--verbose', default=0, type=int,
                     help="whether to print to std out")
@@ -97,7 +98,9 @@ def set_bn_train(m):
 def compute_metrics(cur_model, compact_dataloaders):
     intra_class_similarities = {}
     intra_class_vectors = {}
+    intra_class_vectors_ = {}
     batch_prototypes = {}
+    class_prototypes = {}
     cur_model.multi_out = 1
 
     with torch.no_grad():
@@ -121,21 +124,86 @@ def compute_metrics(cur_model, compact_dataloaders):
                 if k not in intra_class_similarities:
                     intra_class_similarities[k] = []
                     intra_class_vectors[k] = []
+                    intra_class_vectors_[k] = []
 
                 if k not in batch_prototypes:
                     batch_prototypes[k] = []
 
                 #intra_class_similarities[k].extend(all_pairs_nondiag.cpu().numpy().tolist())
                 intra_class_vectors[k].append(feat_vec_unit.cpu())
+                intra_class_vectors_[k].append(feat_vec.cpu())
                 batch_prototypes[k].append(torch.mean(feat_vec,dim=0).cpu())
 
             all_units_k = torch.cat(intra_class_vectors[k],dim=0).to(device)
             all_pairs_k = torch.matmul(all_units_k, all_units_k.t())
             all_pairs_nondiag_k = all_pairs_k.cpu().masked_select(~torch.eye(all_pairs_k.shape[0], dtype=bool)).view(all_pairs_k.shape[0],all_pairs_k.shape[0]-1).flatten()
             intra_class_similarities[k].extend(all_pairs_nondiag_k.cpu().numpy().tolist())
+            
+            class_prototypes[k] = torch.mean(torch.cat(intra_class_vectors_[k], dim=0),dim=0)
 
+        class_CPR_covs = {}
+        covsign = args.nu
+        print (covsign)
+        
+        for k, cdl in compact_dataloaders.items():
+            if k % 10 == 0:
+                print (k)
+
+            cov_k = 0.0
+            samples = []
+            #clone/detach prototypes for L_cov only and sort by cur prototype values 
+            #proto_unit_sort, proto_unit_sort_ind = torch.sort(F.normalize(class_prototypes[k],dim=0).clone().detach().to(device))
+            proto_unit = F.normalize(class_prototypes[k],dim=0).clone().unsqueeze(0)
+
+            for z, data in enumerate(cdl, 0):
+                inputs, labels = data
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                #bs = len(inputs)
+                #samples += bs
+                
+                feat_vec, _ = cur_model(inputs)  
+
+                feat_vec_unit = F.normalize(feat_vec, dim=1)
+                samples.append((feat_vec_unit.cpu()*proto_unit).clone())
+                #reindex feature vectors
+                #feature_vec_unit_sorted = feat_vec_unit[torch.arange(bs).unsqueeze(1),proto_unit_sort_ind]
+
+                #calculate cov contribution unshifted
+                #diffs_unshifted = proto_unit_sort*(feature_vec_unit_sorted - proto_unit_sort)
+
+                #shift
+                #choice = np.random.randint(1,10 + 1)
+                #diffs_shift_left = F.pad(diffs_unshifted,(0,choice))
+                #diffs_shift_right = F.pad(diffs_unshifted,(choice,0))
+
+
+            #Many possible choices for targeting specific off-diagonal covariance contributions
+
+            samples_all = torch.cat(samples,dim=0)
+            cov_all = torch.cov(samples_all.t())
+            #print (cov_all.shape)
+            
+            if covsign == 0:
+                loss_cov = torch.sum(cov_all)                #minimize the magnitude of both sign covariance contributions
+            elif covsign == 1:
+                loss_cov = torch.sum(F.relu(cov_all))                   #minimize only the positive covariance contributions
+            elif covsign == -1:
+                loss_cov = torch.sum(cov_all*torch.eye(len(cov_all)) + F.relu(covsign*(cov_all*(1-torch.eye(len(cov_all))))))         #minimize the magnitude of the negative contributions
+            elif covsign == 2:
+                loss_cov = torch.sum(diffs_shift_left*diffs_shift_right)                           #push everything towards negative (negative conts get larger)
+            elif covsign == 3:
+                loss_cov = torch.sum(-1.0*(diffs_shift_left*diffs_shift_right))                    #push everything towards positive (positive conts get larger)
+            else:
+                raise Exception("Select a valid value for nu covariance parameter from: [-1,0,1,2,3]") 
+
+            #cov_k += loss_cov
+
+            class_CPR_covs[k] = loss_cov 
+                
 
         inter_class_similarities = {}
+        inter_class_sims_sq = {}
 
         for k1, v1 in batch_prototypes.items():
             if k1 % 10 == 0:
@@ -147,20 +215,33 @@ def compute_metrics(cur_model, compact_dataloaders):
                     #print (v2_.shape)
                     v1_norm = F.normalize(v1_, dim=1)
                     v2_norm = F.normalize(v2_, dim=1)
+
+                    #.masked_select(~torch.eye(nclass, dtype=bool)).view(nclass,nclass-1)
+
                     all_pairs = torch.matmul(v1_norm, v2_norm.t()).flatten()
                     #print (all_pairs.shape)
 
                     if k1 not in inter_class_similarities:
                         inter_class_similarities[k1] = []
+                        inter_class_sims_sq[k1] = []
 
                     if k2 not in inter_class_similarities:
                         inter_class_similarities[k2] = []
+                        inter_class_sims_sq[k2] = []
 
                     inter_class_similarities[k1].extend(all_pairs.cpu().numpy().tolist())
                     inter_class_similarities[k2].extend(all_pairs.cpu().numpy().tolist())
+                    inter_class_sims_sq[k1].extend(((1.0-all_pairs)**2.0).cpu().numpy().tolist())
+                    inter_class_sims_sq[k2].extend(((1.0-all_pairs)**2.0).cpu().numpy().tolist())
 
     class_intra_similarity_means, class_inter_similarity_means = [], []
     class_intra_similarity_std, class_inter_similarity_std = [], []
+
+    simple_metric = []
+    simple_metric_2 = []
+    simple_metric_3 = []
+    simple_metric_4 = []
+    exCPR_risks = []
 
     for class_id in intra_class_similarities:
         #print (intra_class_similarities[class_id][0])
@@ -168,8 +249,15 @@ def compute_metrics(cur_model, compact_dataloaders):
         class_inter_similarity_means.append(np.mean(inter_class_similarities[class_id]))
         class_intra_similarity_std.append(np.std(intra_class_similarities[class_id]))
         class_inter_similarity_std.append(np.std(inter_class_similarities[class_id]))
+        simple_metric.append(np.mean(intra_class_similarities[class_id])/np.mean(inter_class_similarities[class_id]))
+        simple_metric_2.append(np.std(intra_class_similarities[class_id]) / (1.0 - np.mean(inter_class_similarities[class_id])))
+        simple_metric_3.append((np.mean(intra_class_similarities[class_id])-2*np.std(intra_class_similarities[class_id]))/(np.mean(inter_class_similarities[class_id]) + 2*np.std(inter_class_similarities[class_id])))
+        simple_metric_4.append(np.mean(intra_class_similarities[class_id])/(np.mean(inter_class_similarities[class_id]) + 2*np.std(inter_class_similarities[class_id])))
 
-    return np.mean(class_intra_similarity_means), np.mean(class_intra_similarity_std), np.mean(class_inter_similarity_means), np.mean(class_inter_similarity_std)
+        exCPR_risks.append(class_CPR_covs[class_id] / np.mean(inter_class_sims_sq[class_id]))
+        
+
+    return np.mean(class_intra_similarity_means), np.mean(class_intra_similarity_std), np.mean(class_inter_similarity_means), np.mean(class_inter_similarity_std), np.mean(exCPR_risks), np.mean(simple_metric), np.mean(simple_metric_2), np.mean(simple_metric_3), np.mean(simple_metric_4)
 
    
 
@@ -240,6 +328,13 @@ def evaluate(model, loader):
 
 
 def main():
+
+    #login(token=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)
+    #ds = load_dataset("imagenet-1k")
+    #train_ds = ds["train"]
+    #train_ds[0]["image"]  # a PIL Image
+
+    
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
 
@@ -260,9 +355,15 @@ def main():
 
 
 
+    #gen_transform = transforms.Compose(
+    #            [transforms.Resize(final_size+32),
+    #             transforms.CenterCrop(final_size),
+    #             transforms.ToTensor(),
+    #             transforms.Normalize(mean, std)
+    #             ])
+
     gen_transform = transforms.Compose(
-                [transforms.Resize(final_size+32),
-                 transforms.CenterCrop(final_size),
+                [transforms.Resize(final_size),
                  transforms.ToTensor(),
                  transforms.Normalize(mean, std)
                  ])
@@ -270,7 +371,7 @@ def main():
     if (args.dataset == "CIFAR100"):
 
         trainset = torchvision.datasets.CIFAR100(root='../data', train=True, download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.CIFAR100(root='../data', train=True, download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.CIFAR100(root='../data', train=True, download=True, transform=gen_transform)
         testset = torchvision.datasets.CIFAR100(root='../data', train=False, download=True, transform=gen_transform)
 
         nclass=100
@@ -280,7 +381,7 @@ def main():
 
     elif (args.dataset == "CIFAR10"):
         trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=gen_transform)
         testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=gen_transform)
 
         nclass=10
@@ -290,7 +391,7 @@ def main():
 
     elif (args.dataset == "STL10"):
         trainset = torchvision.datasets.STL10(root='../data', split='train', download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.STL10(root='../data', split='train', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.STL10(root='../data', split='train', download=True, transform=gen_transform)
         testset = torchvision.datasets.STL10(root='../data', split='test', download=True, transform=gen_transform)
 
         nclass=10
@@ -300,7 +401,7 @@ def main():
 
     elif (args.dataset == "FLOWERS"):
         trainset = torchvision.datasets.Flowers102(root='../data', split='train', download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.Flowers102(root='../data', split='train', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.Flowers102(root='../data', split='train', download=True, transform=gen_transform)
         valset = torchvision.datasets.Flowers102(root='../data', split='val', download=True, transform=gen_transform)
         testset = torchvision.datasets.Flowers102(root='../data', split='test', download=True, transform=gen_transform)
 
@@ -316,7 +417,7 @@ def main():
 
     elif (args.dataset == "OXFORD"):
         trainset = torchvision.datasets.OxfordIIITPet(root='../data', split='trainval', download=True, transform=train_transform)
-        eval_trainset = torchvision.datasets.OxfordIIITPet(root='../data', split='trainval', download=True, transform=train_transform)
+        eval_trainset = torchvision.datasets.OxfordIIITPet(root='../data', split='trainval', download=True, transform=gen_transform)
         testset = torchvision.datasets.OxfordIIITPet(root='../data', split='test', download=True, transform=gen_transform)
         nclass=37
         nchannels=3
@@ -367,7 +468,7 @@ def main():
         # Get indices of data points with the current label
         indices = [i for i, target in enumerate(targs_ds) if target == label]
         # Create a subset of the trainset with the current label
-        subset = Subset(trainset, indices)
+        subset = Subset(eval_trainset, indices)
         # Create a dataloader for the subset
         dataloader = DataLoader(subset, batch_size=args.eval_batch_size, shuffle=True)
         # Add the dataloader to the dictionary
@@ -405,6 +506,14 @@ def main():
     else:
         raise ValueError("Unknown architecture")
 
+    if args.pretrain:
+        if args.arch == "resnet50":
+            model_ft = models.resnet50()
+        elif args.arch == "swin_t":
+            model_ft = models.swin_t()
+        else:
+            print ("ERROR")
+
     #print (model_ft)
     if args.arch not in ["swin_t", "max_vit", "densenet121"]:
         num_ftrs = model_ft.fc.in_features
@@ -428,22 +537,22 @@ def main():
     #wrap feature extractor with new classification head.  Allows explicit return of feature vectors.
     if args.sourceFineTune == "CIFAR100":
         cur_model = TransferWrapper(model_ft, num_ftrs, 100).to(device)
-        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "CIFAR100")))
+        #cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "CIFAR100")))
         cur_model.linear = nn.Linear(num_ftrs, nclass)
         cur_model = cur_model.to(device)
     elif args.sourceFineTune == "OXFORD":
         cur_model = TransferWrapper(model_ft, num_ftrs, 37).to(device)
-        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "OXFORD")))
+        #cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "OXFORD")))
         cur_model.linear = nn.Linear(num_ftrs, nclass)
         cur_model = cur_model.to(device)
     elif args.sourceFineTune == "FLOWERS":
         cur_model = TransferWrapper(model_ft, num_ftrs, 102).to(device)
-        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "FLOWERS")))
+        #cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "FLOWERS")))
         cur_model.linear = nn.Linear(num_ftrs, nclass)
         cur_model = cur_model.to(device)
     elif args.sourceFineTune == "STL10":
         cur_model = TransferWrapper(model_ft, num_ftrs, 10).to(device)
-        cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "STL10")))
+        #cur_model.load_state_dict(torch.load("finetuned_{}_{}.pt".format(args.arch, "STL10")))
         cur_model.linear = nn.Linear(num_ftrs, nclass)
         cur_model = cur_model.to(device)
     else:
@@ -458,8 +567,12 @@ def main():
                           {'params': cur_model.linear.parameters(), 'lr':args.lr_classifier}], lr=args.lr_extractor, momentum=args.momentum, weight_decay=args.weight_decay)
         #optimizer = optim.Adam(cur_model.parameters(), lr=0.00002)
 
-    # Decay LR by a factor of 0.1 every 7 epochs
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+    # Decay LR by a factor of 0.1 every 7 epochs for finetune
+    # Decay LR every 25 epochs for a finetune
+    if args.pretrain:
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.1)
+    else:
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
     
     # define a trainloader and testloader
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True)
@@ -471,7 +584,7 @@ def main():
 
 
     cur_model.multi_out = 1
-    compact_mean, compact_std, sep_mean, sep_std = compute_metrics(cur_model, compact_dataloaders)
+    compact_mean, compact_std, sep_mean, sep_std, exCPR, simp1, simp2, simp3, simp4 = compute_metrics(cur_model, compact_dataloaders)
     cur_model.multi_out = 0
     cur_model.train()
     reset_learnable(cur_model, ft=args.finetune)
@@ -536,9 +649,9 @@ def main():
         test_accs.append(acc_test)
         test_losses.append(loss_test)
 
-        if epoch in [5,10,15,25] and args.finetune:
+        if epoch in [-1] and args.finetune:
             cur_model.multi_out = 1
-            compact_mean, compact_std, sep_mean, sep_std = compute_metrics(cur_model, compact_dataloaders)
+            compact_mean, compact_std, sep_mean, sep_std, exCPR, simp1, simp2, simp3, simp4 = compute_metrics(cur_model, compact_dataloaders)
 
             #print(f"Overall Statistics:\nIntra-class Similarity: Mean = {np.mean(class_)}, Std = {std_intra_sim}, Var = {var_intra_sim}\nInter-class similarity: Mean = {mean_inter_sim}, Std = {std_inter_sim}, Var = {var_inter_sim}\n")
             print(f"Intra-class Similarity: Mean = {compact_mean}, Std = {compact_std}")
@@ -552,11 +665,11 @@ def main():
         #if finetuning, metrics are updated, otherwise, metric evaluation on pre-trained extractor is kept and repeated in text file
         with open('similarity_statistics_{}_trg{}_src{}.txt'.format(args.arch,args.dataset,args.sourceFineTune), 'a') as f:
             if os.stat('similarity_statistics_{}_trg{}_src{}.txt'.format(args.arch,args.dataset,args.sourceFineTune)).st_size == 0:
-                f.write('Dataset, Architecture, Train Batch Size, Classifier LR, Finetune, Feature LR, MaxEpochs, Weight Decay, Momentum, Eval Batch Size, Epoch, Training Acc, Test Acc, Intra-class Similarity Mean, Intra-class Similarity Std, Inter-class Similarity Mean, Inter-class Similarity Std\n')
-            f.write(f"{args.dataset}, {args.arch}, {args.train_batch_size}, {args.lr_classifier}, {args.finetune}, {args.lr_extractor}, {args.epochs_max}, {args.weight_decay}, {args.momentum}, {args.eval_batch_size}, {epoch}, {train_accs[-1]:.5f}, {test_accs[-1]:.5f}, {compact_mean:.6f}, {compact_std:.6f}, {sep_mean:.6f}, {sep_std:.6f}\n")
+                f.write('Dataset, Architecture, Train Batch Size, Classifier LR, Finetune, Feature LR, MaxEpochs, Weight Decay, Momentum, Eval Batch Size, Epoch, Training Acc, Test Acc, Intra-class Similarity Mean, Intra-class Similarity Std, Inter-class Similarity Mean, Inter-class Similarity Std, exCPR, nu, simp1, simp2, simp3, simp4 \n')
+            f.write(f"{args.dataset}, {args.arch}, {args.train_batch_size}, {args.lr_classifier}, {args.finetune}, {args.lr_extractor}, {args.epochs_max}, {args.weight_decay}, {args.momentum}, {args.eval_batch_size}, {epoch}, {train_accs[-1]:.5f}, {test_accs[-1]:.5f}, {compact_mean:.6f}, {compact_std:.6f}, {sep_mean:.6f}, {sep_std:.6f}, {exCPR:.6f}, {args.nu}, {simp1:.6f}, {simp2:.6f}, {simp3:.6f}, {simp4:.6f} \n")
 
-    if args.finetune and not args.sourceFineTune:
-        torch.save(cur_model.state_dict(), "finetuned_{}_{}.pt".format(args.arch, args.dataset))
+    if args.finetune:
+        torch.save(cur_model.state_dict(), "finetuned_{}_{}_ep{}.pt".format(args.arch, args.dataset, args.epochs_max))
 
 
     
